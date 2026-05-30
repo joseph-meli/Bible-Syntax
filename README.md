@@ -1,7 +1,7 @@
 # Bible-Syntax
 All praise be to the Lord Jesus! There is now clause, phrase, and syntactical analysis for E-Sword! This content was designed for the iOS versions of E-Sword.
 
-This content was created by using Python scripts to pull data from publicy available online datasets and turn them into a functional tool to understand meanings and nuances in the Bible.
+This content was created by using Python scripts to pull data from publicy available online datasets and turn them into a functional tool to understand meanings and nuances in the Bible. There are also pre-release html documents embedded with all the data for use on other platforms. Any software that will open HTML files will work. The CSS version is used in the E-Sword commentary module.
 
 The Old Testmament data was taken from the text-fabric representation of the Hebrew Bible Database, [BHSA](https://github.com/ETCBC/bhsa), containing the text of the Hebrew Bible augmented with linguistic annotations compiled by the Eep Talstra Centre for Bible and Computer, VU University Amsterdam.
 
