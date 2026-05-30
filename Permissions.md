@@ -1,5 +1,3 @@
-Permissions
-
 [BHSA - ETCBC](https://github.com/ETCBC/bhsa)
 MIT License
 
