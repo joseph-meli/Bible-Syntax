@@ -170,25 +170,48 @@ def download_n1904():
 # ---------------------------------------------------------------------------
 def download_strong():
     print("\n" + "=" * 40)
-    print("DATASET 3: BHS Strong's numbers (eliranwong/BHS-Strong-no)")
+    print("DATASET 3: BHS Strong's numbers + KJV versification mapping")
     print("=" * 40)
 
     zip_path  = os.path.join(BASE_DIR, "bhs_strong.zip")
     csv_path  = os.path.join(STRONG_DIR, "BHS-with-Strong-no-extended.csv")
+    kjv_dir   = os.path.join(BASE_DIR, "bhs_kjv_map")
 
+    # Strong's CSV
     if os.path.exists(csv_path) and os.path.getsize(csv_path) > 100_000:
-        print("  Already downloaded. Skipping.")
-        return
+        print("  Strong's CSV already downloaded. Skipping.")
+    else:
+        url = "https://github.com/eliranwong/BHS-Strong-no/raw/master/BHS-with-Strong-no-extended.csv.zip"
+        download_file(url, zip_path, "BHS-Strong-no")
+        if os.path.exists(STRONG_DIR):
+            shutil.rmtree(STRONG_DIR)
+        os.makedirs(STRONG_DIR, exist_ok=True)
+        extract_zip_flat(zip_path, STRONG_DIR)
+        print("  Strong's done -> " + STRONG_DIR)
 
-    # Download just the CSV zip from the repo root
-    url = "https://github.com/eliranwong/BHS-Strong-no/raw/master/BHS-with-Strong-no-extended.csv.zip"
-    download_file(url, zip_path, "BHS-Strong-no")
-
-    if os.path.exists(STRONG_DIR):
-        shutil.rmtree(STRONG_DIR)
-    os.makedirs(STRONG_DIR, exist_ok=True)
-    extract_zip_flat(zip_path, STRONG_DIR)
-    print("  Strong's done -> " + STRONG_DIR)
+    # KJV versification mapping from OpenHebrewBible 008-BHS-mapping-KJV
+    os.makedirs(kjv_dir, exist_ok=True)
+    kjv_csvs = [f for f in os.listdir(kjv_dir) if f.endswith(".csv")]
+    if kjv_csvs:
+        print("  KJV mapping already downloaded (" + str(len(kjv_csvs)) + " files). Skipping.")
+    else:
+        print("  Downloading KJV versification mapping (OpenHebrewBible 008)...")
+        full_zip = os.path.join(BASE_DIR, "ohb_full.zip")
+        url = "https://github.com/eliranwong/OpenHebrewBible/archive/refs/heads/master.zip"
+        download_file(url, full_zip, "OpenHebrewBible")
+        extracted = 0
+        with zipfile.ZipFile(full_zip, "r") as z:
+            for member in z.namelist():
+                if "008-BHS-mapping-KJV" in member and member.endswith(".csv"):
+                    data = z.read(member)
+                    fname = os.path.basename(member)
+                    with open(os.path.join(kjv_dir, fname), "wb") as f:
+                        f.write(data)
+                    print("  Extracted: " + fname + " (" + str(len(data)//1000) + " KB)")
+                    extracted += 1
+        if os.path.exists(full_zip):
+            os.remove(full_zip)
+        print("  KJV mapping done: " + str(extracted) + " files -> " + kjv_dir)
 
 
 # ---------------------------------------------------------------------------
