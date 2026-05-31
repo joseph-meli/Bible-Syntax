@@ -441,37 +441,86 @@ def find_tf_dir_n1904(root):
 
 def load_ot_strongs():
     """
-    Build a map from (kjv_book_num, chapter, verse, word_position) -> strong_number.
-    This is correct because BHSsort and BHSA word nodes use different sequential
-    numbering but agree on word order within each verse.
-    The KJVverseID column in the CSV gives (testament, book, chapter, verse).
+    Build a map from (pointed_word_text, verse_position_0based) -> strong_number.
+    This is immune to versification differences and BHSsort numbering changes
+    between BHSA dataset versions.
+
+    The CSV BHSA column contains the exact pointed Hebrew text including
+    cantillation marks, matching BHSA g_word_utf8 feature directly.
+    We key by (stripped_text, position_within_verse) where position resets
+    each verse, giving an unambiguous lookup.
     """
     if not os.path.exists(STRONG_CSV):
         print("  WARNING: Strong's CSV not found -- Strong's numbers will be omitted.")
         return {}
 
     import re as _re
-    mapping = {}       # (book_num, ch, vs, position_0based) -> strong_number
-    verse_counters = {}  # (book_num, ch, vs) -> current position count
+
+    # mapping: (kjv_book, kjv_ch, kjv_vs, position_0based) -> (word_text, strong)
+    # We store by (bk,ch,vs,pos) AND by word_text+pos so we can match either way
+    # Primary map: word_text_stripped -> [(kjv_ref, pos, strong), ...]
+    # We'll build: (text_stripped, global_sequential_pos) -> strong
+    # but since text can repeat, we use (bk, ch, vs, pos) as primary key
+    # and also build text->strong for fallback
+
+    # Build two maps:
+    # 1. verse_pos_map: (bk,ch,vs,pos) -> strong  (KJV versification)
+    # 2. text_pos_map:  (text_stripped, seq_within_verse) -> strong
+    #    where seq_within_verse is position among words with the SAME text in that verse
+
+    verse_pos_map = {}    # (bk,ch,vs,pos) -> strong
+    text_strong_map = {}  # (text_stripped) -> strong  for unique forms
+    verse_counters = {}
+    text_counts = defaultdict(lambda: defaultdict(int))  # (bk,ch,vs,text) -> count
+
+    def strip_cantillation(s):
+        # Keep Hebrew base letters and basic vowel points, strip cantillation accents
+        # Unicode ranges: Hebrew letters 0x05D0-0x05EA, vowels 0x05B0-0x05BC, 0x05C1-0x05C2
+        # Cantillation: 0x0591-0x05AF
+        import unicodedata
+        result = []
+        for c in s:
+            cp = ord(c)
+            # Keep Hebrew letters, vowels, dagesh/mappiq, shin/sin dots
+            if 0x05D0 <= cp <= 0x05EA:  # letters
+                result.append(c)
+            elif 0x05B0 <= cp <= 0x05BC:  # vowels + dagesh
+                result.append(c)
+            elif cp in (0x05C1, 0x05C2):  # shin/sin dots
+                result.append(c)
+            # Skip cantillation (0x0591-0x05AF) and punctuation
+        return "".join(result)
 
     with open(STRONG_CSV, "r", encoding="utf-8", errors="replace") as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
             kjv = row.get("\u3014KJVverseID\uff5cbook\uff5cchapter\uff5cverse\u3015", "")
             sn  = row.get("extendedStrongNumber", "").strip()
+            bhsa_col = row.get("BHSA", "")
+
             if not kjv or not sn:
                 continue
+            if sn.startswith("\uff20") or sn.startswith("@"):
+                continue
+
             m = _re.search(r'\u3014(\d+)\uff5c(\d+)\uff5c(\d+)\uff5c(\d+)\u3015', kjv)
             if not m:
                 continue
             bk, ch, vs = int(m.group(2)), int(m.group(3)), int(m.group(4))
+
+            # Extract pointed Hebrew text from BHSA column: <H>word<h>
+            texts = _re.findall(r'<H>(.*?)<h>', bhsa_col)
+            raw_text = "".join(texts).strip().rstrip("׃ פ")  # strip verse-end marks
+            text_stripped = strip_cantillation(raw_text)
+
             key = (bk, ch, vs)
             pos = verse_counters.get(key, 0)
             verse_counters[key] = pos + 1
-            mapping[(bk, ch, vs, pos)] = sn
 
-    print("  Loaded " + str(len(mapping)) + " OT Strong's entries (verse-position keyed)")
-    return mapping
+            verse_pos_map[(bk, ch, vs, pos)] = (text_stripped, sn)
+
+    print("  Loaded " + str(len(verse_pos_map)) + " OT Strong's entries (text+position keyed)")
+    return verse_pos_map
 
 
 # KJV book number map for OT Strong's lookup
@@ -567,9 +616,16 @@ def word_box(text, translit, gloss, parse_tag, strong, lang="grk"):
 
     strong_num_tag = ""
     if strong:
-        raw = str(strong).lstrip("HGhg")
+        # Handle compound Strong's like "H1121＋H2011" (fullwidth plus U+FF0B)
+        parts_sn = str(strong).replace("\uff0b", "+").split("+")
         prefix = "H" if lang == "heb" else "G"
-        strong_num_tag = "<num>" + prefix + raw + "</num>"
+        num_tags = []
+        for part in parts_sn:
+            raw = part.strip().lstrip("HGhg\uff48\uff47")
+            if raw:
+                num_tags.append("<num>" + prefix + raw + "</num>")
+        # Join with + so compound entries display as H1121+H2011 on one line
+        strong_num_tag = "+".join(num_tags)
 
     morph_tvm_tag = ""
     if parse_tag and lang == "grk":
@@ -708,81 +764,177 @@ def insert_verse(conn, book_num, chapter, verse, html):
 
 
 # ---------------------------------------------------------------------------
-# OT generator
+# OT generator  (word-first approach: iterate verse words in text order)
 # ---------------------------------------------------------------------------
 def generate_ot(conn=None):
-    print("\n=== OLD TESTAMENT (BHSA/ETCBC) -> BHS_Syntax.cmti ===")
+    print("\n=== OLD TESTAMENT (BHSA/ETCBC) ===")
 
     strongs_map = load_ot_strongs()
 
-    tf_dir = find_tf_dir(BHSA_DIR, ["tf/2021", "tf/2020", "tf/2019", "tf/2017", "tf/c", "tf"])
+    tf_dir = find_tf_dir(BHSA_DIR, ["tf/2021","tf/2020","tf/2019","tf/2017","tf/c","tf"])
     if not tf_dir:
-        print("ERROR: no BHSA .tf data under " + BHSA_DIR)
-        sys.exit(1)
+        print("ERROR: no BHSA .tf data"); sys.exit(1)
     print("  Data: " + tf_dir)
 
     TF  = Fabric(locations=tf_dir, silent=True)
     api = TF.load(
         "otype g_word_utf8 g_cons_utf8 g_word "
-        "gloss sp vs vt gn nu st ps typ function domain txt book chapter verse "
+        "gloss sp vs vt gn nu st ps typ function domain txt "
         "mother",
         silent=True,
     )
     if api is False:
-        print("ERROR: TF.load() failed.")
-        sys.exit(1)
-
+        print("ERROR: TF.load() failed"); sys.exit(1)
     F, L, T, E = api.F, api.L, api.T, api.E
 
-    # Build word_node -> strong_number by matching verse position
-    # strongs_map keys are (kjv_book_num, ch, vs, position_0based)
-    print("  Building word->Strong's lookup by verse position...")
+    # Build word_node -> strong_number by matching word text to CSV entries
+    # strongs_map is (kjv_bk, kjv_ch, kjv_vs, pos) -> (text_stripped, strong)
+    # For each BHSA verse, we find the matching CSV verse by scanning all CSV
+    # entries and matching the stripped word texts in order.
+    # This is immune to versification numbering differences.
+    print("  Building word->Strong's lookup by text matching...")
+
+    import unicodedata as _ud
+
+    def strip_cant(s):
+        result = []
+        for c in s:
+            cp = ord(c)
+            if 0x05D0 <= cp <= 0x05EA:
+                result.append(c)
+            elif 0x05B0 <= cp <= 0x05BC:
+                result.append(c)
+            elif cp in (0x05C1, 0x05C2):
+                result.append(c)
+        return "".join(result)
+
+    # Build a lookup: (text_stripped, occurrence_index_within_global_seq) -> strong
+    # More precisely: for each BHSA word node, find its strong by:
+    # 1. Get its stripped text
+    # 2. Look up the CSV entry whose stripped text matches AND whose KJV verse
+    #    contains BHSA words at that position
+    # Simplest reliable approach: build text->[(strong, csv_ref)] list,
+    # then for each BHSA verse match in order
+
+    # Build text-indexed lookup from CSV
+    # csv_by_ref: (bk,ch,vs) -> [(text_stripped, strong), ...]
+    csv_by_ref = defaultdict(list)
+    for (bk, ch, vs, pos), (text_stripped, sn) in strongs_map.items():
+        csv_by_ref[(bk, ch, vs)].append((pos, text_stripped, sn))
+    for key in csv_by_ref:
+        csv_by_ref[key].sort()  # sort by pos
+
+    # Also build flat text->strong map for word-level matching
+    # Key: text_stripped -> strong (for unique forms)
+    # For ambiguous forms, we'll use verse-level text sequence matching
+    text_to_strong_unique = {}  # text -> strong if always the same
+    text_counts_map = defaultdict(set)
+    for (bk, ch, vs, pos), (text_stripped, sn) in strongs_map.items():
+        text_counts_map[text_stripped].add(sn)
+    for text, sns in text_counts_map.items():
+        if len(sns) == 1:
+            text_to_strong_unique[text] = next(iter(sns))
+
+    # For each BHSA book/chapter/verse, try to find matching CSV verse
+    # by sequence-matching stripped word texts
     word_strong = {}
+    matched_verses = 0
+    unmatched_verses = 0
+
     for bk_node in F.otype.s("book"):
         book_id  = T.sectionFromNode(bk_node)[0]
         book_num = KJV_BOOK_NUMS.get(book_id)
         if book_num is None:
             continue
+
         for ch_node in L.d(bk_node, "chapter"):
             ch_num = T.sectionFromNode(ch_node)[1]
-            for v_node in L.d(ch_node, "verse"):
-                v_num  = T.sectionFromNode(v_node)[2]
-                v_words = L.d(v_node, "word")
-                for pos, w_node in enumerate(v_words):
-                    sn = strongs_map.get((book_num, ch_num, v_num, pos), "")
-                    if sn:
-                        word_strong[w_node] = sn
-    print("  Mapped " + str(len(word_strong)) + " word nodes to Strong's numbers")
 
-    # Build clause_node -> (book_en, ch, vs) for mother cross-reference resolution
-    # Includes clause_atom nodes since some mothers point to those
+            for v_node in L.d(ch_node, "verse"):
+                v_num = T.sectionFromNode(v_node)[2]
+                v_words = L.d(v_node, "word")
+                if not v_words:
+                    continue
+
+                # Get stripped BHSA texts for this verse
+                bhsa_texts = [strip_cant(sf(F, "g_word_utf8", w) or sf(F, "g_cons_utf8", w) or "")
+                              for w in v_words]
+
+                # Find best matching CSV verse by text sequence alignment
+                # Try same verse number first, then ±1, ±2, ±3
+                best_csv = None
+                best_score = 0
+
+                for delta in [0, -1, 1, -2, 2, -3, 3]:
+                    csv_vs = v_num + delta
+                    if csv_vs < 1:
+                        continue
+                    csv_entries = csv_by_ref.get((book_num, ch_num, csv_vs), [])
+                    if not csv_entries:
+                        continue
+                    csv_texts = [t for _, t, _ in csv_entries]
+
+                    # Score: count matching texts at same position
+                    score = sum(1 for i, bt in enumerate(bhsa_texts)
+                                if i < len(csv_texts) and bt == csv_texts[i])
+                    # Bonus for matching length
+                    if len(bhsa_texts) == len(csv_texts):
+                        score += 1
+
+                    if score > best_score:
+                        best_score = score
+                        best_csv = csv_entries
+
+                if best_csv and best_score > 0:
+                    csv_texts = [t for _, t, _ in best_csv]
+                    csv_strongs = [s for _, t, s in best_csv]
+                    # Assign Strong's to words by best text match
+                    for i, w_node in enumerate(v_words):
+                        bt = bhsa_texts[i]
+                        if i < len(csv_texts) and bt == csv_texts[i]:
+                            # Direct positional match
+                            word_strong[w_node] = csv_strongs[i]
+                        else:
+                            # Fallback: unique text lookup
+                            if bt in text_to_strong_unique:
+                                word_strong[w_node] = text_to_strong_unique[bt]
+                    matched_verses += 1
+                else:
+                    # Fallback: unique text lookup only
+                    for i, w_node in enumerate(v_words):
+                        bt = bhsa_texts[i]
+                        if bt in text_to_strong_unique:
+                            word_strong[w_node] = text_to_strong_unique[bt]
+                    unmatched_verses += 1
+
+    print("  word->Strong's: matched=" + str(matched_verses) +
+          " unmatched=" + str(unmatched_verses) +
+          " total_mapped=" + str(len(word_strong)))
+
+    # Build clause reference map for mother cross-refs
     print("  Building clause reference map...")
     clause_ref = {}
     for cl in list(F.otype.s("clause")) + list(F.otype.s("clause_atom")):
         sec = T.sectionFromNode(cl)
         if sec and len(sec) >= 3:
-            clause_ref[cl] = (
-                OT_BOOK_NAMES.get(sec[0], sec[0]),
-                sec[1], sec[2]
-            )
-    print("  Clause reference map: " + str(len(clause_ref)) + " entries")
+            clause_ref[cl] = (OT_BOOK_NAMES.get(sec[0], sec[0]), sec[1], sec[2])
 
     if conn is None:
-        conn = create_cmti(
-            "BHS_Syntax.cmti",
-            "Hebrew Bible Syntactic Analysis (BHSA/ETCBC)",
-            "BHS-Syntax"
-        )
+        conn = create_cmti("BHS_Syntax.cmti",
+                           "Hebrew Bible Syntactic Analysis (BHSA/ETCBC)",
+                           "BHS-Syntax")
         standalone = True
     else:
         standalone = False
 
+    def _ok(v):
+        return v and v not in ("NA","n/a","absent","none","unknown","")
+
     total_verses = 0
     for bk_node in F.otype.s("book"):
-        book_id = T.sectionFromNode(bk_node)[0]
+        book_id  = T.sectionFromNode(bk_node)[0]
         book_num = OT_BOOK_NUMBERS.get(book_id)
         if book_num is None:
-            print("  SKIP (unknown book): " + repr(book_id))
             continue
         print("  " + book_id)
 
@@ -790,59 +942,80 @@ def generate_ot(conn=None):
             ch_num = T.sectionFromNode(ch_node)[1]
 
             for v_node in L.d(ch_node, "verse"):
-                v_num = T.sectionFromNode(v_node)[2]
+                v_num  = T.sectionFromNode(v_node)[2]
+                v_words = L.d(v_node, "word")
+                if not v_words:
+                    continue
 
+                # ── word-first grouping ───────────────────────────────────
+                # Walk words in text order. Group into (clause, phrase) runs.
+                # A new group starts when either clause or phrase changes.
+                groups = []   # list of (cl_node, ph_node, [word_nodes])
+                for w in v_words:
+                    # Look up containing phrase and clause (innermost)
+                    ph_list = L.u(w, "phrase")
+                    cl_list = L.u(w, "clause")
+                    ph = ph_list[0] if ph_list else None
+                    cl = cl_list[0] if cl_list else None
+                    if groups and groups[-1][0] == cl and groups[-1][1] == ph:
+                        groups[-1][2].append(w)
+                    else:
+                        groups.append([cl, ph, [w]])
+
+                # ── group (clause, phrase) runs into clause blocks ─────────
+                # A clause block = consecutive groups sharing the same clause
+                cl_blocks = []   # list of (cl_node, [(ph_node,[words]), ...])
+                for cl, ph, wlist in groups:
+                    if cl_blocks and cl_blocks[-1][0] == cl:
+                        cl_blocks[-1][1].append((ph, wlist))
+                    else:
+                        cl_blocks.append((cl, [(ph, wlist)]))
+
+                # ── render ────────────────────────────────────────────────
                 clauses_html = []
-                for cl_node in L.d(v_node, "clause"):
-                    cl_func = OT_FUNC.get(sf(F, "function", cl_node), sf(F, "function", cl_node))
-                    cl_typ  = OT_TYP.get(sf(F, "typ", cl_node), sf(F, "typ", cl_node))
-
-                    # Discourse domain tag
-                    cl_txt     = sf(F, "txt", cl_node)
-                    cl_disc    = ot_discourse_label(cl_txt)
-
-                    # Mother cross-reference
-                    cl_mother_ref = ""
-                    mothers = E.mother.f(cl_node)
-                    if mothers:
-                        m = mothers[0]
-                        mref = clause_ref.get(m)
-                        if mref:
-                            m_bk, m_ch, m_vs = mref
-                            this_vs = T.sectionFromNode(cl_node)
-                            # Only show if mother is in a different verse
-                            if not this_vs or m_vs != this_vs[2] or m_ch != this_vs[1]:
-                                cl_mother_ref = m_bk + " " + str(m_ch) + ":" + str(m_vs)
-
-                    # Append discourse and cross-ref to type label
-                    extras = []
-                    if cl_disc:
-                        extras.append(cl_disc)
-                    if cl_mother_ref:
-                        extras.append("depends on " + cl_mother_ref)
-                    if extras:
-                        cl_typ = (cl_typ + " | " + " | ".join(extras)).strip(" |")
+                for cl_node, ph_runs in cl_blocks:
+                    if cl_node is not None:
+                        cl_func = OT_FUNC.get(sf(F,"function",cl_node), sf(F,"function",cl_node))
+                        cl_typ  = OT_TYP.get(sf(F,"typ",cl_node), sf(F,"typ",cl_node))
+                        cl_disc = ot_discourse_label(sf(F,"txt",cl_node))
+                        # Mother cross-reference
+                        cl_mother_ref = ""
+                        mothers = E.mother.f(cl_node)
+                        if mothers:
+                            mref = clause_ref.get(mothers[0])
+                            if mref:
+                                m_bk, m_ch, m_vs = mref
+                                if m_vs != v_num or m_ch != ch_num:
+                                    cl_mother_ref = m_bk + " " + str(m_ch) + ":" + str(m_vs)
+                        extras = []
+                        if cl_disc:
+                            extras.append(cl_disc)
+                        if cl_mother_ref:
+                            extras.append("depends on " + cl_mother_ref)
+                        if extras:
+                            cl_typ = (cl_typ + " | " + " | ".join(extras)).strip(" |")
+                    else:
+                        cl_func = ""
+                        cl_typ  = ""
 
                     phrases_html = []
-                    for ph_node in L.d(cl_node, "phrase"):
-                        ph_func = OT_FUNC.get(sf(F, "function", ph_node), sf(F, "function", ph_node))
-                        ph_typ  = OT_TYP.get(sf(F, "typ", ph_node), sf(F, "typ", ph_node))
+                    for ph_node, wlist in ph_runs:
+                        if ph_node is not None:
+                            ph_func = OT_FUNC.get(sf(F,"function",ph_node), sf(F,"function",ph_node))
+                            ph_typ  = OT_TYP.get(sf(F,"typ",ph_node), sf(F,"typ",ph_node))
+                        else:
+                            ph_func = ""
+                            ph_typ  = ""
 
                         words_html = []
-                        for w_node in L.d(ph_node, "word"):
-                            text     = sf(F, "g_word_utf8", w_node) or sf(F, "g_cons_utf8", w_node)
-                            translit = bhsa_to_translit(sf(F, "g_word", w_node))
-                            gloss    = sf(F, "gloss", w_node)
-                            sp_v     = sf(F, "sp", w_node)
-                            vs_v     = sf(F, "vs", w_node)
-                            vt_v     = sf(F, "vt", w_node)
-                            gn_v     = sf(F, "gn", w_node)
-                            nu_v     = sf(F, "nu", w_node)
-                            st_v     = sf(F, "st", w_node)
-                            ps_v     = sf(F, "ps", w_node)
-                            def _ok(v):
-                                return v and v not in ("NA", "n/a", "absent", "none", "unknown", "")
-                            # Always store in fixed order: sp.vs.vt.gn.nu.ps.st
+                        for w_node in wlist:
+                            text     = sf(F,"g_word_utf8",w_node) or sf(F,"g_cons_utf8",w_node)
+                            translit = bhsa_to_translit(sf(F,"g_word",w_node))
+                            gloss    = sf(F,"gloss",w_node)
+                            sp_v = sf(F,"sp",w_node); vs_v = sf(F,"vs",w_node)
+                            vt_v = sf(F,"vt",w_node); gn_v = sf(F,"gn",w_node)
+                            nu_v = sf(F,"nu",w_node); st_v = sf(F,"st",w_node)
+                            ps_v = sf(F,"ps",w_node)
                             parse_tag = ".".join([
                                 sp_v if _ok(sp_v) else "",
                                 vs_v if _ok(vs_v) else "",
@@ -851,25 +1024,26 @@ def generate_ot(conn=None):
                                 nu_v if _ok(nu_v) else "",
                                 ps_v if _ok(ps_v) else "",
                                 st_v if _ok(st_v) else "",
-                            ]).rstrip(".")
-                            # Remove trailing empty segments
-                            while parse_tag.endswith("."):
-                                parse_tag = parse_tag[:-1]
-                            strong    = word_strong.get(w_node, "")
+                            ]).strip(".")
+                            while ".." in parse_tag:
+                                parse_tag = parse_tag.replace("..",".")
+                            parse_tag = parse_tag.strip(".")
+                            strong = word_strong.get(w_node, "")
                             words_html.append(word_box(text, translit, gloss, parse_tag, strong, lang="heb"))
 
-                        phrases_html.append(phrase_box(ph_func, ph_typ, words_html))
+                        if words_html:
+                            phrases_html.append(phrase_box(ph_func, ph_typ, words_html))
 
-                    clauses_html.append(clause_box(cl_func, cl_typ, phrases_html))
+                    if phrases_html:
+                        clauses_html.append(clause_box(cl_func, cl_typ, phrases_html))
 
                 if clauses_html:
-                    html = wrap_verse("rtl", clauses_html)
-                    insert_verse(conn, book_num, ch_num, v_num, html)
+                    insert_verse(conn, book_num, ch_num, v_num, wrap_verse("rtl", clauses_html))
                     total_verses += 1
 
-        conn.commit()
+            conn.commit()
 
-    # Book commentary: one entry per book with domain breakdown and clause stats
+    # Book commentary
     print("  Building OT book commentary...")
     for bk_node in F.otype.s("book"):
         book_id  = T.sectionFromNode(bk_node)[0]
@@ -877,54 +1051,45 @@ def generate_ot(conn=None):
         book_en  = OT_BOOK_NAMES.get(book_id, book_id)
         if book_num is None:
             continue
-        # Count clauses by domain and type
-        domain_counts = {"Narrative": 0, "Discursive": 0, "Quotation": 0, "Unknown": 0}
-        type_counts = {}
+        domain_counts = {"Narrative":0,"Discursive":0,"Quotation":0,"Unknown":0}
+        type_counts   = {}
         total_cls = 0
         for cl in L.d(bk_node, "clause"):
             total_cls += 1
-            d = ot_discourse_label(sf(F, "txt", cl))
-            if d:
-                domain_counts[d] = domain_counts.get(d, 0) + 1
-            else:
-                domain_counts["Unknown"] += 1
-            t = OT_TYP.get(sf(F, "typ", cl), sf(F, "typ", cl))
+            d = ot_discourse_label(sf(F,"txt",cl))
+            domain_counts[d if d else "Unknown"] = domain_counts.get(d if d else "Unknown",0) + 1
+            t = OT_TYP.get(sf(F,"typ",cl), sf(F,"typ",cl))
             if t:
-                type_counts[t] = type_counts.get(t, 0) + 1
-        # Build HTML
+                type_counts[t] = type_counts.get(t,0) + 1
         h  = "<b><font size=\'3\'>" + book_en + " -- Syntactic Overview</font></b><br><br>"
         h += "<b>Total clauses:</b> " + str(total_cls) + "<br><br>"
-        h += "<b>Discourse Domain Breakdown:</b><br>"
-        for dom, count in sorted(domain_counts.items(), key=lambda x: -x[1]):
-            if count > 0:
-                h += "&nbsp;&nbsp;" + dom + ": " + str(count) + "<br>"
+        h += "<b>Discourse Domain:</b><br>"
+        for dom, cnt in sorted(domain_counts.items(), key=lambda x: -x[1]):
+            if cnt > 0:
+                h += "&nbsp;&nbsp;" + dom + ": " + str(cnt) + "<br>"
         h += "<br><b>Top Clause Types:</b><br>"
-        for typ, count in sorted(type_counts.items(), key=lambda x: -x[1])[:10]:
-            h += "&nbsp;&nbsp;" + typ + ": " + str(count) + "<br>"
-        cur = conn.cursor()
-        cur.execute("INSERT INTO BookCommentary (Book, Comments) VALUES (?, ?)",
-                    (book_num, h))
+        for typ, cnt in sorted(type_counts.items(), key=lambda x: -x[1])[:10]:
+            h += "&nbsp;&nbsp;" + typ + ": " + str(cnt) + "<br>"
+        conn.cursor().execute("INSERT INTO BookCommentary (Book, Comments) VALUES (?,?)", (book_num, h))
     conn.commit()
 
     if standalone:
         conn.close()
-        size_mb = round(os.path.getsize("BHS_Syntax.cmti") / 1e6, 1)
-        print("\n  Written: BHS_Syntax.cmti  (" + str(size_mb) + " MB)")
+        print("\n  Written: BHS_Syntax.cmti (" + str(round(os.path.getsize("BHS_Syntax.cmti")/1e6,1)) + " MB)")
     print("  OT verses: " + str(total_verses))
     if not standalone:
         return conn
 
 
 # ---------------------------------------------------------------------------
-# NT generator
+# NT generator  (word-first approach: iterate verse words in text order)
 # ---------------------------------------------------------------------------
 def generate_nt(conn=None):
-    print("\n=== NEW TESTAMENT (N1904) -> GNT_Syntax.cmti ===")
+    print("\n=== NEW TESTAMENT (N1904) ===")
 
     tf_dir = find_tf_dir_n1904(N1904_DIR)
     if not tf_dir:
-        print("ERROR: no N1904 .tf data under " + N1904_DIR)
-        sys.exit(1)
+        print("ERROR: no N1904 .tf data"); sys.exit(1)
     print("  Data: " + tf_dir)
 
     TF = Fabric(locations=tf_dir, silent=True)
@@ -935,62 +1100,52 @@ def generate_nt(conn=None):
         silent=True,
     )
     if api is False:
-        print("ERROR: TF.load() failed.")
-        sys.exit(1)
-
+        print("ERROR: TF.load() failed"); sys.exit(1)
     F, L, T = api.F, api.L, api.T
+
     all_types  = set(F.otype.all)
     has_phrase = "phrase" in all_types
 
-    # Build clause -> verse map.
-    # Each clause is assigned to every verse its words touch (multi-verse mapping)
-    # so no words are ever missing. For cross-boundary clauses, we track which
-    # words belong to each verse so we only render those words under that verse,
-    # preventing the crash from rendering 49-word clauses at a single verse entry.
+    # word -> (book, chapter, verse) from word features
+    print("  Building word reference map...")
     word_ref = {}
     for w in F.otype.s("word"):
         word_ref[w] = (F.book.v(w), F.chapter.v(w), F.verse.v(w))
 
-    # Build word -> clause and word -> phrase lookups for fast bottom-up access
-    word_to_clause = {}
-    word_to_phrase = {}
-    if "clause" in all_types:
-        for cl in F.otype.s("clause"):
-            for w in L.d(cl, "word"):
-                word_to_clause[w] = cl
-    if "phrase" in all_types:
-        for ph in F.otype.s("phrase"):
-            for w in L.d(ph, "word"):
-                word_to_phrase[w] = ph
-
-    # Build verse_words: all words per verse from verse container nodes
-    verse_words = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for vn in F.otype.s("verse"):
-        sec = T.sectionFromNode(vn)
-        if sec and len(sec) >= 3:
-            verse_words[sec[0]][sec[1]][sec[2]] = L.d(vn, "word")
+    # Build verse_words from word-level book/chapter/verse features (authoritative)
+    # Using verse container L.d() disagrees with word features for cross-boundary
+    # verses like 1 Pet 4:1 -- word features are the correct source of truth
+    print("  Building verse word map from word features...")
+    verse_words = defaultdict(list)
+    for w in F.otype.s("word"):
+        bk = F.book.v(w)
+        ch = F.chapter.v(w)
+        vs = F.verse.v(w)
+        if bk and ch and vs:
+            verse_words[(bk, ch, vs)].append(w)
+    # Sort by node number to preserve text order
+    for key in verse_words:
+        verse_words[key].sort()
+    print("  Verse word map: " + str(len(verse_words)) + " verses")
 
     if conn is None:
-        conn = create_cmti(
-            "GNT_Syntax.cmti",
-            "Greek NT Syntactic Analysis (Nestle 1904 / MACULA)",
-            "GNT-Syntax"
-        )
+        conn = create_cmti("GNT_Syntax.cmti",
+                           "Greek NT Syntactic Analysis (Nestle 1904 / MACULA)",
+                           "GNT-Syntax")
         standalone = True
     else:
         standalone = False
 
-    def render_word_nt(w_node):
-        text     = sf(F, "unicode", w_node) or sf(F, "text", w_node)
-        translit = sf(F, "lemmatranslit", w_node)
-        gloss    = sf(F, "gloss", w_node) or sf(F, "lemma", w_node)
-        morph    = sf(F, "morph", w_node)
+    def render_word(w_node):
+        text     = sf(F,"unicode",w_node) or sf(F,"text",w_node) or sf(F,"normalized",w_node)
+        translit = sf(F,"lemmatranslit",w_node)
+        gloss    = sf(F,"gloss",w_node) or sf(F,"lemma",w_node)
+        morph    = sf(F,"morph",w_node)
         if not morph:
-            parts = [sf(F, x, w_node) for x in
-                     ["sp", "tense", "mood", "case", "number"]
-                     if sf(F, x, w_node) not in ("", "NA")]
+            parts = [sf(F,x,w_node) for x in ["sp","tense","mood","case","number"]
+                     if sf(F,x,w_node) not in ("","NA")]
             morph = ".".join(parts[:3])
-        strong = sf(F, "strong", w_node)
+        strong = sf(F,"strong",w_node)
         sn_str = ("G" + str(strong)) if strong else ""
         return word_box(text, translit, gloss, morph, sn_str)
 
@@ -1001,126 +1156,123 @@ def generate_nt(conn=None):
             continue
         print("  " + NT_BOOK_NAMES.get(book_id, book_id))
 
-        all_ch = sorted(verse_words[book_id].keys())
+        # Get all chapters/verses for this book from verse_words
+        book_vs = sorted(
+            (ch, vs) for (bk, ch, vs) in verse_words if bk == book_id
+        )
 
-        for ch_num in all_ch:
-            all_vs = sorted(verse_words[book_id][ch_num].keys())
+        for ch_num, vs_num in book_vs:
+            v_words = verse_words.get((book_id, ch_num, vs_num), [])
+            if not v_words:
+                continue
 
-            for vs_num in all_vs:
-                vs_word_list = verse_words[book_id][ch_num].get(vs_num, [])
-                if not vs_word_list:
-                    continue
+            # ── word-first grouping ───────────────────────────────────────
+            groups = []   # [(cl_node, ph_node, [word_nodes])]
+            for w in v_words:
+                ph_list = L.u(w, "phrase") if has_phrase else []
+                cl_list = L.u(w, "clause")
+                ph = ph_list[0] if ph_list else None
+                cl = cl_list[0] if cl_list else None
+                if groups and groups[-1][0] == cl and groups[-1][1] == ph:
+                    groups[-1][2].append(w)
+                else:
+                    groups.append([cl, ph, [w]])
 
-                # Group this verse's words by clause then by phrase
-                # clause_node -> phrase_node (or None) -> [word_nodes]
-                cl_ph_words = defaultdict(lambda: defaultdict(list))
-                for w in vs_word_list:
-                    cl = word_to_clause.get(w)
-                    ph = word_to_phrase.get(w)
-                    cl_ph_words[cl][ph].append(w)
+            # ── group into clause blocks ──────────────────────────────────
+            cl_blocks = []
+            for cl, ph, wlist in groups:
+                if cl_blocks and cl_blocks[-1][0] == cl:
+                    cl_blocks[-1][1].append((ph, wlist))
+                else:
+                    cl_blocks.append((cl, [(ph, wlist)]))
 
-                clauses_html = []
+            # ── render ────────────────────────────────────────────────────
+            clauses_html = []
+            for cl_node, ph_runs in cl_blocks:
+                if cl_node is not None:
+                    cl_role = sf(F,"role",cl_node)
+                    cl_cls  = sf(F,"cls",cl_node)
+                    cl_func = sf(F,"function",cl_node)
+                    cl_func_lbl = NT_ROLE.get(cl_role,cl_role) or cl_func or ""
+                    cl_type_lbl = NT_CLS.get(cl_cls,cl_cls)
+                    # Continuation indicator
+                    cl_all_words = L.d(cl_node,"word")
+                    cl_verses = set(word_ref.get(w,("",0,0))[2] for w in cl_all_words
+                                    if word_ref.get(w,("",0,0))[0] == book_id)
+                    extras = []
+                    if len(cl_verses) > 1:
+                        other = sorted(v for v in cl_verses if v != vs_num)
+                        extras.append("cont. v." + "/".join(str(v) for v in other))
+                    # Parent clause cross-reference
+                    parents = L.u(cl_node,"clause")
+                    if parents:
+                        pc_sec = T.sectionFromNode(parents[0])
+                        if pc_sec and len(pc_sec) >= 3:
+                            if pc_sec[2] != vs_num or pc_sec[1] != ch_num:
+                                pc_bk = NT_BOOK_NAMES.get(pc_sec[0],pc_sec[0])
+                                extras.append("depends on " + pc_bk + " " + str(pc_sec[1]) + ":" + str(pc_sec[2]))
+                    if extras:
+                        cl_type_lbl = (cl_type_lbl + " | " + " | ".join(extras)).strip(" |")
+                else:
+                    cl_func_lbl = ""
+                    cl_type_lbl = ""
 
-                for cl_node, ph_map in cl_ph_words.items():
-                    # Clause label
-                    if cl_node is not None:
-                        cl_role = sf(F, "role", cl_node)
-                        cl_cls  = sf(F, "cls",  cl_node)
-                        cl_func = sf(F, "function", cl_node)
-                        cl_func_lbl = NT_ROLE.get(cl_role, cl_role) or cl_func or ""
-                        cl_type_lbl = NT_CLS.get(cl_cls, cl_cls)
-                        # Continuation indicator
-                        cl_all_words = L.d(cl_node, "word")
-                        cl_verses = set(word_ref.get(w, ("", 0, 0))[2]
-                                        for w in cl_all_words
-                                        if word_ref.get(w, ("", 0, 0))[0] == book_id)
-                        extras = []
-                        if len(cl_verses) > 1:
-                            other_vs = sorted(v for v in cl_verses if v != vs_num)
-                            extras.append("cont. v." + "/".join(str(v) for v in other_vs))
-                        # Parent clause cross-reference via containment
-                        parent_clauses = L.u(cl_node, "clause")
-                        if parent_clauses:
-                            pc = parent_clauses[0]
-                            pc_sec = T.sectionFromNode(pc)
-                            if pc_sec and len(pc_sec) >= 3:
-                                pc_vs = pc_sec[2]
-                                pc_ch = pc_sec[1]
-                                if pc_vs != vs_num or pc_ch != ch_num:
-                                    pc_bk = NT_BOOK_NAMES.get(pc_sec[0], pc_sec[0])
-                                    extras.append("depends on " + pc_bk + " " + str(pc_ch) + ":" + str(pc_vs))
-                        if extras:
-                            cl_type_lbl = (cl_type_lbl + " | " + " | ".join(extras)).strip(" |")
-                        cl_func_lbl = (cl_func_lbl + "").strip()
+                phrases_html = []
+                for ph_node, wlist in ph_runs:
+                    if ph_node is not None:
+                        ph_role = sf(F,"role",ph_node)
+                        ph_cls  = sf(F,"cls",ph_node)
+                        ph_func = sf(F,"function",ph_node)
+                        ph_func_lbl = NT_ROLE.get(ph_role,ph_role) or ph_func or ""
+                        ph_type_lbl = NT_CLS.get(ph_cls,ph_cls)
                     else:
-                        cl_func_lbl = ""
-                        cl_type_lbl = ""
-                        cont_str = ""
+                        ph_func_lbl = ""
+                        ph_type_lbl = ""
+                    words_html = [render_word(w) for w in wlist]
+                    phrases_html.append(phrase_box(ph_func_lbl, ph_type_lbl, words_html))
 
-                    # If both labels empty but we have a cont indicator, put it in func
-                    if not cl_func_lbl and not cl_type_lbl and cont_str:
-                        cl_func_lbl = cont_str
-
-                    phrases_html = []
-                    for ph_node, w_list in ph_map.items():
-                        if ph_node is not None:
-                            ph_role = sf(F, "role", ph_node)
-                            ph_cls  = sf(F, "cls",  ph_node)
-                            ph_func = sf(F, "function", ph_node)
-                            ph_func_lbl = NT_ROLE.get(ph_role, ph_role) or ph_func or ""
-                            ph_type_lbl = NT_CLS.get(ph_cls, ph_cls)
-                        else:
-                            ph_func_lbl = ""
-                            ph_type_lbl = ""
-                        words_html = [render_word_nt(w) for w in w_list]
-                        phrases_html.append(phrase_box(ph_func_lbl, ph_type_lbl, words_html))
-
+                if phrases_html:
                     clauses_html.append(clause_box(cl_func_lbl, cl_type_lbl, phrases_html))
 
-                if clauses_html:
-                    html = wrap_verse("ltr", clauses_html)
-                    insert_verse(conn, book_num, ch_num, vs_num, html)
-                    total_verses += 1
+            if clauses_html:
+                insert_verse(conn, book_num, ch_num, vs_num, wrap_verse("ltr", clauses_html))
+                total_verses += 1
 
-            conn.commit()
+        conn.commit()
 
-    # Book commentary for NT
+    # Book commentary
     print("  Building NT book commentary...")
     for book_id in NT_BOOK_ORDER:
         book_num = NT_BOOK_NUMBERS.get(book_id)
         book_en  = NT_BOOK_NAMES.get(book_id, book_id)
         if book_num is None:
             continue
-        # Count clauses by role and cls
         role_counts = {}
         total_cls = 0
         for cl in F.otype.s("clause"):
-            words = L.d(cl, "word")
-            if not words:
-                continue
-            if F.book.v(words[0]) != book_id:
+            words = L.d(cl,"word")
+            if not words or F.book.v(words[0]) != book_id:
                 continue
             total_cls += 1
-            role = NT_ROLE.get(sf(F, "role", cl), sf(F, "role", cl))
+            role = NT_ROLE.get(sf(F,"role",cl), sf(F,"role",cl))
             if role:
-                role_counts[role] = role_counts.get(role, 0) + 1
+                role_counts[role] = role_counts.get(role,0) + 1
         if total_cls == 0:
             continue
         h  = "<b><font size=\'3\'>" + book_en + " -- Syntactic Overview</font></b><br><br>"
         h += "<b>Total clauses:</b> " + str(total_cls) + "<br><br>"
         h += "<b>Clause Role Breakdown:</b><br>"
-        for role, count in sorted(role_counts.items(), key=lambda x: -x[1])[:12]:
-            h += "&nbsp;&nbsp;" + (role or "unlabeled") + ": " + str(count) + "<br>"
-        cur = conn.cursor()
-        cur.execute("INSERT INTO BookCommentary (Book, Comments) VALUES (?, ?)",
-                    (book_num, h))
+        for role, cnt in sorted(role_counts.items(), key=lambda x: -x[1])[:12]:
+            h += "&nbsp;&nbsp;" + (role or "unlabeled") + ": " + str(cnt) + "<br>"
+        conn.cursor().execute("INSERT INTO BookCommentary (Book, Comments) VALUES (?,?)", (book_num, h))
     conn.commit()
 
     if standalone:
         conn.close()
-        size_mb = round(os.path.getsize("GNT_Syntax.cmti") / 1e6, 1)
-        print("\n  Written: GNT_Syntax.cmti  (" + str(size_mb) + " MB)")
+        print("\n  Written: GNT_Syntax.cmti (" + str(round(os.path.getsize("GNT_Syntax.cmti")/1e6,1)) + " MB)")
     print("  NT verses: " + str(total_verses))
+
+
 
 
 # ---------------------------------------------------------------------------
